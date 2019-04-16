@@ -9,6 +9,11 @@ RUN mkdir -p ve \
     && . $(pwd)/ve/jupyterlab/bin/activate \
     && pip install --no-cache-dir jupyterlab
 
+# Include virtualenv to support older python environments
+RUN python3 -m venv $(pwd)/ve/virtualenv \
+    && . $(pwd)/ve/virtualenv/bin/activate \
+    && pip install --no-cache-dir virtualenv
+
 FROM build AS enable-widgets
 # ipywidgets requries nodejs
 COPY --from=node:lts-stretch /usr/local/ /usr/local/
@@ -24,10 +29,8 @@ ARG BASEDIR="/jupyter-base"
 COPY --from=enable-widgets ${BASEDIR}/ ${BASEDIR}/
 WORKDIR ${BASEDIR}
 
-# Include virtualenv for older python support
-RUN python3 -m venv $(pwd)/ve/virtualenv \
-    && . $(pwd)/ve/virtualenv/bin/activate \
-    && pip install --no-cache-dir virtualenv
+
+FROM remove-node AS configure-environment
 
 # Link jupyter and virtualenv to $PATH
 RUN ln -s \
@@ -37,39 +40,30 @@ RUN ln -s \
     $(pwd)/ve/virtualenv/bin/virtualenv \
     /usr/local/bin
 
+# python-dev is required for some pip packages
+RUN apt update && apt install -y \
+    python-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Configure a basic set of tools for jupyter terminal
 RUN apt update && apt install -y \
+    bash \
     man \
-    python-dev \
     tmux \
     vim \
     zip \
     && rm -rf /var/lib/apt/lists/*
 
-FROM remove-node AS drop-privileges
-ENV USER=jupyteruser
-
-# Work in a user app directory
-WORKDIR /jupyter
-
-# Create the user and chown the working directory
-RUN groupadd -g 9999 $USER \
-    && useradd -u 9999 -g $USER $USER \
-    && chown -R $USER:$USER $(pwd) \
-    && usermod \
-    --shell /bin/bash \
-    --home $(pwd) \
-    $USER
-
-# From here forward files may be shared with host
-# To ease sharing I want all files writeable by group
-RUN chfn --other='umask=002' $USER
-
-# Drop privileges
-USER $USER
+# Set up a clean and sensible home directory
+ENV HOME=/jupyter
 
 # Configure the default jupyter terminal shell
 ENV SHELL=/bin/bash
+
+WORKDIR $HOME
+
+# Patch settings into /etc/passwd
+RUN sed -i "s|^root.*$|root:x:0:0:root:$HOME:$SHELL|" /etc/passwd
 
 # Create volume subfolders
 RUN mkdir -p \
@@ -83,11 +77,9 @@ RUN mkdir -p \
 # (This gets overridden by bind mounts)
 COPY sh sh
 
-# Link jupyter configuration files
-RUN ln -s \
-    $(pwd)/config $HOME/.jupyter \
-    && ln -s \
-    $(pwd)/kernels $HOME/.local/share/jupyter/
+# Link jupyter configuration files to the root of the volume
+RUN ln -s $(pwd)/config $HOME/.jupyter \
+    && ln -s $(pwd)/kernels $HOME/.local/share/jupyter/
 
 # Generate a default config file
 # (This gets overridden by bind mounts)
@@ -95,16 +87,15 @@ RUN jupyter lab --generate-config
 
 # Configure the server options
 ENTRYPOINT ["jupyter","lab"]
-CMD ["--ip=0.0.0.0","--no-browser","--notebook-dir=/jupyter/notebooks"]
+CMD ["--ip=0.0.0.0","--no-browser","--notebook-dir=/jupyter/notebooks","--allow-root"]
 EXPOSE 8888
 # Persist the virtualenvs, kernels, config, etc.
 VOLUME /jupyter
 
-FROM drop-privileges AS dev
-USER root
+FROM configure-environment AS dev
 ENTRYPOINT ["/usr/bin/env","bash"]
 
-FROM drop-privileges AS release
+FROM configure-environment AS release
 
 LABEL org.opencontainers.image.url="https://hub.docker.com/r/rexypoo/jupyterlab" \
       org.opencontainers.image.documentation="https://hub.docker.com/r/rexypoo/jupyterlab" \
